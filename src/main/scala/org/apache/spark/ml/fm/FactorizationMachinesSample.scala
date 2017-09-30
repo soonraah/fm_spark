@@ -22,7 +22,7 @@ object FactorizationMachinesSample {
 
     // Get from http://files.grouplens.org/datasets/movielens/ml-latest-small.zip
     val ratingsFile = "data/ml-latest-small/ratings.csv"
-    val dfFeatue = createRatingDataFrame(spark, ratingsFile)
+    val dfFeature = createRatingDataFrame(spark, ratingsFile)
 
     val fm = new FactorizationMachinesSGD()
     val paramMap = new ParamGridBuilder()
@@ -35,7 +35,7 @@ object FactorizationMachinesSample {
       .setEstimatorParamMaps(paramMap)
       .setEvaluator(new RegressionEvaluator())
       .setNumFolds(2)
-      .fit(dfFeatue)
+      .fit(dfFeature)
 
     cvModel.avgMetrics.foreach(println)
   }
