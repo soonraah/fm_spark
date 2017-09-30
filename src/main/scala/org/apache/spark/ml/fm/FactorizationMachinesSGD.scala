@@ -1,7 +1,7 @@
 package org.apache.spark.ml.fm
 
 import org.apache.spark.ml.Estimator
-import org.apache.spark.ml.linalg.{DenseVector, Vector}
+import org.apache.spark.ml.linalg.{DenseVector, Vector, Vectors}
 import org.apache.spark.ml.param.{Param, ParamMap}
 import org.apache.spark.ml.param.shared.HasStepSize
 import org.apache.spark.ml.util.Identifiable
@@ -86,16 +86,26 @@ class FactorizationMachinesSGD(override val uid: String)
 
     val dfData = data.cache()
 
-    def udfVecToMap = udf { (vec: Vector) => {
+    val udfVecToMap = udf { (vec: Vector) => {
       val m = scala.collection.mutable.Map[Int, Double]()
       vec.foreachActive { (i, value) => m += (i -> value) }
       m
     } }
 
+    val udfL1RegularizationVec = udf {
+      (v: Vector, shrinkageVal: Double) => {
+        Vectors.dense(
+          v.toArray.map { w => math.signum(w) * math.max(0.0, math.abs(w) - shrinkageVal) }
+        )
+      }
+    }
+
+    val udfZeroVector = udf { () => Vectors.zeros(getDimFactorization) }
+
     val dfMiniBatchArray = dfData
       .randomSplit(Array.fill(getMaxIter)(getMiniBatchFraction), 1234L)
 
-    dfMiniBatchArray
+    val trainedModel = dfMiniBatchArray
       .zipWithIndex
       .foldLeft[FactorizationMachinesModel](initialModel) {
       (model, tuple) => {
@@ -111,16 +121,8 @@ class FactorizationMachinesSGD(override val uid: String)
           log.warn(s"Iteration ($iter/$getMaxIter). The size of sampled batch is zero")
           model
         } else {
-          // Explode features
-          val dfData = dfMiniBatch
-            .select(
-              $"sampleId",
-              $"label",
-              explode(udfVecToMap(col("features"))).as(Seq("featureId", "featureValue"))
-            )
-
           // label, sampleId, featureId, prediction, loss, deltaWi, deltaVi
-          val dfLossGrad = model.calcLossGrad(dfData).cache()
+          val dfLossGrad = model.calcLossGrad(dfMiniBatch).cache()
 
           // Calculate loss
           val lossSum = dfLossGrad
@@ -133,45 +135,65 @@ class FactorizationMachinesSGD(override val uid: String)
           // Update weights
           val dfUpdated = dfLossGrad
             .select(
-              ((col($(predictionCol)) - col($(labelCol))) * col("deltaWi")) as "deltaWi",
-              ((col($(predictionCol)) - col($(labelCol))) * col("deltaVi")) as "deltaVi"
+              col("featureId"),
+              (col("deltaWi") * col($(predictionCol)) - col($(labelCol))) as "deltaWi",
+              FactorizationMachinesModel.udfVecMultipleByScalar(col("deltaVi"), col($(predictionCol)) - col($(labelCol))) as "deltaVi"
             )
             .groupBy(col("featureId"))
             .agg(
               ((sum("deltaWi") / miniBatchSize) * currentStepSize) as "deltaWiSum",
-              ((sum("deltaVi") / miniBatchSize) * currentStepSize) as "deltaViSum"
+              FactorizationMachinesModel.udfVecMultipleByScalar(
+                (new VectorSum(getDimFactorization))(col("deltaVi")),
+                lit(currentStepSize / miniBatchSize)
+              ) as "deltaViSum"
             )
             .join(model.dimensionStrength, col("featureId") === model.dimensionStrength("id"), "outer")
             .join(model.factorizedInteraction, col("featureId") === model.factorizedInteraction("id"), "outer")
             .select(
               col("featureId"),
-              (col("strength") - col("deltaWiSum")) as "strength",
-              FactorizationMachinesModel.udfVecMinusVec(col("vec"), col("deltaViSum")) as "factorizedInteraction"
+              (coalesce(col("strength"), lit(0.0)) - coalesce(col("deltaWiSum"), lit(0.0))) as "strength",
+              FactorizationMachinesModel.udfVecMinusVec(
+                coalesce(col("vec"), udfZeroVector()),
+                coalesce(col("deltaViSum"), udfZeroVector())
+              ) as "factorizedInteraction"
             )
             .select(    // L1 regularization
               col("featureId"),
               (signum(col("strength")) * greatest(lit(0.0), abs(col("strength")) - shrinkageVal)) as "strength",
-              (signum(col("factorizedInteraction")) * greatest(lit(0.0), abs(col("factorizedInteraction")) - shrinkageVal)) as "factorizedInteraction"
+              udfL1RegularizationVec(col("factorizedInteraction"), lit(shrinkageVal)) as "factorizedInteraction"
             )
             .cache()
 
           // Create a new model
-          new FactorizationMachinesModel(
+          val updatedModel = new FactorizationMachinesModel(
             uid,
             model.dimFactorization,
             model.globalBias,
             dfUpdated
               .map {
-                row => Strength(row.getAs[Long]("featureId"), row.getAs[Double]("strength"))
-              },
+                row => Strength(row.getAs[Int]("featureId"), row.getAs[Double]("strength"))
+              }
+              .cache(),
             dfUpdated
               .map {
-                row => FactorizedInteraction(row.getAs[Long]("featureId"), row.getAs[DenseVector]("factorizedInteraction"))
+                row => FactorizedInteraction(row.getAs[Int]("featureId"), row.getAs[DenseVector]("factorizedInteraction"))
               }
+              .cache()
           )
+
+          // clean
+          dfLossGrad.unpersist()
+          dfUpdated.unpersist()
+          model.dimensionStrength.unpersist()
+          model.factorizedInteraction.unpersist()
+
+          updatedModel
         }
       }
     }
+
+    dfData.unpersist()
+    trainedModel
   }
 
   override def copy(extra: ParamMap): Estimator[FactorizationMachinesModel] = defaultCopy(extra)

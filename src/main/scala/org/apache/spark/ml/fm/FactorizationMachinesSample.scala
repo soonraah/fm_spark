@@ -25,7 +25,10 @@ object FactorizationMachinesSample {
     val dfFeatue = createRatingDataFrame(spark, ratingsFile)
 
     val fm = new FactorizationMachinesSGD()
-    val paramMap = new ParamGridBuilder().addGrid(fm.regParam, Array(0.1, 0.01)).build()
+    val paramMap = new ParamGridBuilder()
+      .addGrid(fm.regParam, Array(0.1, 0.01))
+      .addGrid(fm.maxIter, Array(5))
+      .build()
 
     val cvModel = new CrossValidator()
       .setEstimator(fm)
@@ -34,13 +37,13 @@ object FactorizationMachinesSample {
       .setNumFolds(2)
       .fit(dfFeatue)
 
-    println(cvModel.avgMetrics)
+    cvModel.avgMetrics.foreach(println)
   }
 
   private def createRatingDataFrame(spark: SparkSession, ratingFile: String): DataFrame = {
     // userId,movieId,rating,timestamp
     val udfCrateFeatureVec = udf {
-      (userId: Int, movieRatings: Array[_], currentMovie: Int) => {
+      (userId: Int, movieRatings: Seq[_], currentMovie: Int) => {
         val featureMap = movieRatings
           .map { s =>
             val items = s.toString.split(":")
@@ -50,7 +53,7 @@ object FactorizationMachinesSample {
           .map { t => (t._1 + MaxUserId + MaxMovieId, t._2)}
           .toMap + (userId -> 1.0) + (MaxUserId + currentMovie -> 1.0)
 
-        Vectors.sparse(featureMap.size, featureMap.toSeq)
+        Vectors.sparse(MaxUserId + MaxMovieId + MaxMovieId, featureMap.toSeq)
       }
     }
 

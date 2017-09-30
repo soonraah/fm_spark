@@ -38,6 +38,13 @@ class FactorizationMachinesModel(override val uid: String,
                                  val factorizedInteraction: Dataset[FactorizedInteraction])
   extends Model[FactorizationMachinesModel] with FactorizationMachinesModelParams {
 
+  setDefault(
+    sampleIdCol -> "sampleId",
+    featuresCol -> "features",
+    predictionCol -> "prediction",
+    labelCol -> "label"
+  )
+
   override def copy(extra: ParamMap): FactorizationMachinesModel = {
     val copied = new FactorizationMachinesModel(uid, dimFactorization, globalBias, dimensionStrength, factorizedInteraction)
     copyValues(copied, extra).setParent(parent)
@@ -90,6 +97,8 @@ class FactorizationMachinesModel(override val uid: String,
   def calcLossGrad(dfSampleIndexed: DataFrame): DataFrame = {
     val bcW0 = dfSampleIndexed.sqlContext.sparkContext.broadcast(globalBias)
 
+    val udfZeroVector = udf { () => Vectors.zeros(dimFactorization) }
+
     dfSampleIndexed
       .select(
         col($(labelCol)),
@@ -102,12 +111,18 @@ class FactorizationMachinesModel(override val uid: String,
         col($(labelCol)),
         col("sampleId"),
         col("featureId"),
-        coalesce(col("strength"), lit(0.0)),
-        coalesce(col("vec"), lit(Vectors.zeros(dimFactorization))) as "factorizedInteraction",
+        col("featureValue"),
+        coalesce(col("strength"), lit(0.0)) as "strength",
+        coalesce(col("vec"), udfZeroVector()) as "factorizedInteraction"
+      )
+      .select(
+        col($(labelCol)),
+        col("sampleId"),
+        col("featureId"),
         col("featureValue") as "xi",
-        dimensionStrength("strength") * col("featureValue") as "wixi",
-        FactorizationMachinesModel.udfVecMultipleByScalar(factorizedInteraction("vec"), col("featureValue")) as "vfxi",
-        FactorizationMachinesModel.vi2xi2(factorizedInteraction("vec"), col("featureValue")) as "vi2xi2"
+        col("strength") * col("featureValue") as "wixi",
+        FactorizationMachinesModel.udfVecMultipleByScalar(col("factorizedInteraction"), col("featureValue")) as "vfxi",
+        FactorizationMachinesModel.vi2xi2(col("factorizedInteraction"), col("featureValue")) as "vi2xi2"
       )
       .select(
         col($(labelCol)),
@@ -208,7 +223,7 @@ object FactorizationMachinesModel {
   * @param id feature ID
   * @param strength strength (w_i)
   */
-case class Strength(id: Long, strength: Double)
+case class Strength(id: Int, strength: Double)
 
 /**
   * Factorized interaction between i-th and j-th features
@@ -216,4 +231,4 @@ case class Strength(id: Long, strength: Double)
   * @param id feature ID
   * @param vec factorized interaction as vector (v_i) with length k
   */
-case class FactorizedInteraction(id: Long, vec: DenseVector)
+case class FactorizedInteraction(id: Int, vec: DenseVector)
