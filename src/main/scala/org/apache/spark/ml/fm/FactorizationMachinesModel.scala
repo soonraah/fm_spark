@@ -21,8 +21,6 @@ private[fm] trait FactorizationMachinesModelParams
     with HasLabelCol
 {
   val sampleIdCol = new Param[String](this, "sampleIdCol", "column name for sample ID")
-
-  set(sampleIdCol, "sampleId")
 }
 
 /**
@@ -98,14 +96,14 @@ class FactorizationMachinesModel(override val uid: String,
         col("sampleId"),
         explode(FactorizationMachinesModel.udfVecToMap(col($(featuresCol)))) as Seq("featureId", "featureValue")
       )
-      .join(dimensionStrength, col("featureId") === dimensionStrength("id"), "inner")
-      .join(factorizedInteraction, col("featureId") === factorizedInteraction("id"), "inner")
+      .join(dimensionStrength, col("featureId") === dimensionStrength("id"), "left_outer")
+      .join(factorizedInteraction, col("featureId") === factorizedInteraction("id"), "left_outer")
       .select(
         col($(labelCol)),
         col("sampleId"),
         col("featureId"),
-        col("strength"),
-        col("vec") as "factorizedInteraction",
+        coalesce(col("strength"), lit(0.0)),
+        coalesce(col("vec"), lit(Vectors.zeros(dimFactorization))) as "factorizedInteraction",
         col("featureValue") as "xi",
         dimensionStrength("strength") * col("featureValue") as "wixi",
         FactorizationMachinesModel.udfVecMultipleByScalar(factorizedInteraction("vec"), col("featureValue")) as "vfxi",

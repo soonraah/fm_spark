@@ -40,10 +40,29 @@ class FactorizationMachinesSGD(override val uid: String)
   /** @group setParam */
   def setMaxIter(value: Int): this.type = set(maxIter, value)
 
+  def setMiniBatchFraction(value: Double): this.type = set(miniBatchFraction, value)
+
+  def setRegParam(value: Double): this.type = set(regParam, value)
+
+  def setStepSize(value: Double): this.type = set(stepSize, value)
+
+  setDefault(
+    dimFactorization -> 10,
+    featuresCol -> "features",
+    labelCol -> "label",
+    predictionCol -> "prediction",
+    sampleIdCol -> "sampleId",
+    maxIter -> 10,
+    miniBatchFraction -> 0.1,
+    regParam -> 0.1,
+    stepSize -> 1.0
+  )
+
   override def fit(dataset: Dataset[_]): FactorizationMachinesModel = {
     transformSchema(dataset.schema)
 
     val sparkSession = dataset.sparkSession
+    import sparkSession.implicits._
 
     // create empty model
     val initialModel = new FactorizationMachinesModel(

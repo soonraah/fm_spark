@@ -33,6 +33,7 @@ private[fm] trait FactorizationMachinesParams
   protected def validateAndTransformSchema(schema: StructType): StructType = {
     SchemaUtils.checkColumnType(schema, $(featuresCol), new VectorUDT)
     SchemaUtils.checkColumnType(schema, $(labelCol), DoubleType)
+    schema
   }
 }
 
