@@ -46,6 +46,10 @@ class FactorizationMachinesSGD(override val uid: String)
 
   def setStepSize(value: Double): this.type = set(stepSize, value)
 
+  def setMinLabel(value: Double): this.type = set(minLabel, value)
+
+  def setMaxLabel(value: Double): this.type = set(maxLabel, value)
+
   setDefault(
     dimFactorization -> 10,
     featuresCol -> "features",
@@ -55,7 +59,9 @@ class FactorizationMachinesSGD(override val uid: String)
     maxIter -> 10,
     miniBatchFraction -> 0.1,
     regParam -> 0.1,
-    stepSize -> 1.0
+    stepSize -> 1.0,
+    minLabel -> 0.0,
+    maxLabel -> 1.0
   )
 
   override def fit(dataset: Dataset[_]): FactorizationMachinesModel = {
@@ -72,6 +78,8 @@ class FactorizationMachinesSGD(override val uid: String)
       sparkSession.createDataset(Seq[Strength]()),
       sparkSession.createDataset(Seq[FactorizedInteraction]())
     )
+      .setMinLabel(getMinLabel)
+      .setMaxLabel(getMaxLabel)
 
     val dsSampleIndexed = FactorizationMachinesModel
       .addSampleId(dataset, $(sampleIdCol))

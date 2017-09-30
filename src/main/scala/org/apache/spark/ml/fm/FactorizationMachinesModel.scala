@@ -20,7 +20,14 @@ private[fm] trait FactorizationMachinesModelParams
     with HasPredictionCol
     with HasLabelCol
 {
-  val sampleIdCol = new Param[String](this, "sampleIdCol", "column name for sample ID")
+  val sampleIdCol = new Param[String](this, "sampleIdCol", "Column name for sample ID")
+  def getSampleIdCol: String = $(sampleIdCol)
+
+  val minLabel = new Param[Double](this, "minLabel", "Minimum label value")
+  def getMinLabel: Double = $(minLabel)
+
+  val maxLabel = new Param[Double](this, "maxLabel", "Maximum label value")
+  def getMaxLabel: Double = $(maxLabel)
 }
 
 /**
@@ -38,11 +45,17 @@ class FactorizationMachinesModel(override val uid: String,
                                  val factorizedInteraction: Dataset[FactorizedInteraction])
   extends Model[FactorizationMachinesModel] with FactorizationMachinesModelParams {
 
+  def setMinLabel(value: Double): this.type = set(minLabel, value)
+
+  def setMaxLabel(value: Double): this.type = set(maxLabel, value)
+
   setDefault(
     sampleIdCol -> "sampleId",
     featuresCol -> "features",
     predictionCol -> "prediction",
-    labelCol -> "label"
+    labelCol -> "label",
+    minLabel -> 0.0,
+    maxLabel -> 1.0
   )
 
   override def copy(extra: ParamMap): FactorizationMachinesModel = {
@@ -91,6 +104,10 @@ class FactorizationMachinesModel(override val uid: String,
       .select(
         col("sampleId"),
         (FactorizationMachinesModel.sumVx(col("vfxiSum"), col("vi2xi2Sum")) + col("wixiSum") + bcW0.value) as $(predictionCol)
+      )
+      .select(
+        col("sampleId"),
+        least(greatest(col($(predictionCol)), lit(getMinLabel)), lit(getMaxLabel)) as $(predictionCol)
       )
   }
 
@@ -164,6 +181,14 @@ class FactorizationMachinesModel(override val uid: String,
         col("sampleId"),
         col("featureId"),
         (FactorizationMachinesModel.sumVx(col("vfxiSum"), col("vi2xi2Sum")) + col("wixiSum") + bcW0.value) as $(predictionCol),
+        col("deltaWi"),
+        col("deltaVi")
+      )
+      .select(
+        col($(labelCol)),
+        col("sampleId"),
+        col("featureId"),
+        least(greatest(col($(predictionCol)), lit(getMinLabel)), lit(getMaxLabel)) as $(predictionCol),
         col("deltaWi"),
         col("deltaVi")
       )

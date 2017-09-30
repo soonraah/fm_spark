@@ -22,15 +22,22 @@ object FactorizationMachinesSample {
 
     // Get from http://files.grouplens.org/datasets/movielens/ml-latest-small.zip
     val ratingsFile = "data/ml-latest-small/ratings.csv"
+
+    // Create DataFrames
     val dfFeature = createRatingDataFrame(spark, ratingsFile)
     val dfs = dfFeature.randomSplit(Array(0.9, 0.1))
-    val dfTraining = dfs(0)
-    val dfEvaluation = dfs(1)
+    val dfTraining = dfs(0)     // for cross validation
+    val dfEvaluation = dfs(1)   // for test
 
+    val (minLabel, maxLabel) = getMinMaxLabel(dfFeature)
+
+    // Run cross validation
     val fm = new FactorizationMachinesSGD()
     val paramMap = new ParamGridBuilder()
       .addGrid(fm.regParam, Array(0.1, 0.01))
       .addGrid(fm.maxIter, Array(5))
+      .addGrid(fm.minLabel, Array(1.0))
+      .addGrid(fm.maxLabel, Array(5.0))
       .build()
 
     val cvModel = new CrossValidator()
@@ -40,8 +47,7 @@ object FactorizationMachinesSample {
       .setNumFolds(2)
       .fit(dfTraining)
 
-    cvModel.avgMetrics.foreach(println)
-
+    // Test
     cvModel.transform(dfEvaluation).show(100)
   }
 
@@ -92,5 +98,12 @@ object FactorizationMachinesSample {
         col("rating") as "label",
         udfCrateFeatureVec(col("userId"), col("movieRatings"), col("movieId")) as "features"
       )
+  }
+
+  private def getMinMaxLabel(dfLabeled: DataFrame): (Double, Double) = {
+    import dfLabeled.sparkSession.implicits._
+    dfLabeled
+      .map { row => val label = row.getAs[Double]("label"); (label, label) }
+      .reduce { (a, b) => (math.min(a._1, b._1), math.max(a._2, b._2)) }
   }
 }
