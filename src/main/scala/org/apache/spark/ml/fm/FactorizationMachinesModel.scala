@@ -11,6 +11,8 @@ import org.apache.spark.sql.functions.{col, _}
 import org.apache.spark.sql.types.{FloatType, StructType}
 import org.apache.spark.sql.{DataFrame, Dataset}
 
+import scala.util.Random
+
 /**
   *
   */
@@ -67,33 +69,52 @@ class FactorizationMachinesModel(override val uid: String,
   override def transform(dataset: Dataset[_]): DataFrame = {
     transformSchema(dataset.schema)
 
+    import dataset.sparkSession.implicits._
+
     val dfSampleIndexed = FactorizationMachinesModel.addSampleId(dataset, $(sampleIdCol)).cache()
 
     val predicted = predict(dfSampleIndexed)
 
-    dfSampleIndexed
-      .join(predicted, dfSampleIndexed("sampleId") === predicted("sampleId"), "left_outer")
-      .drop(dfSampleIndexed("sampleId"))
-      .drop(predicted("sampleId"))
+    dfSampleIndexed.as("si")
+      .join(
+        predicted.as("p"),
+        $"si.sampleId" === $"p.sampleId",
+        "left_outer"
+      )
+      .drop($"si.sampleId")
+      .drop($"p.sampleId")
       .na.fill(globalBias, Seq($(predictionCol)))
   }
 
 
   private def predict(dfSampleIndexed: DataFrame): DataFrame = {
-    val bcW0 = dfSampleIndexed.sqlContext.sparkContext.broadcast(globalBias)
+    val spark = dfSampleIndexed.sparkSession
+
+    import spark.implicits._
+
+    val bcW0 = spark.sparkContext.broadcast(globalBias)
 
     dfSampleIndexed
       .select(
         dfSampleIndexed("sampleId"),
         explode(FactorizationMachinesModel.udfVecToMap(dfSampleIndexed($(featuresCol)))) as Seq("featureId", "featureValue")
       )
-      .join(dimensionStrength, col("featureId") === dimensionStrength("id"), "inner")
-      .join(factorizedInteraction, col("featureId") === factorizedInteraction("id"), "inner")
+      .as("exploded")
+      .join(
+        dimensionStrength as "ds",
+        $"exploded.featureId" === $"ds.id",
+        "inner"
+      )
+      .join(
+        factorizedInteraction as "fi",
+        $"exploded.featureId" === $"fi.id",
+        "inner"
+      )
       .select(
         col("sampleId"),
-        dimensionStrength("strength") * col("featureValue") as "wixi",
-        FactorizationMachinesModel.udfVecMultipleByScalar(factorizedInteraction("vec"), col("featureValue")) as "vfxi",
-        FactorizationMachinesModel.vi2xi2(factorizedInteraction("vec"), col("featureValue")) as "vi2xi2"
+        $"ds.strength" * col("featureValue") as "wixi",
+        FactorizationMachinesModel.udfVecMultipleByScalar($"fi.vec", col("featureValue")) as "vfxi",
+        FactorizationMachinesModel.vi2xi2($"fi.vec", col("featureValue")) as "vi2xi2"
       )
       .groupBy(col("sampleId"))
       .agg(
@@ -111,10 +132,18 @@ class FactorizationMachinesModel(override val uid: String,
       )
   }
 
-  def calcLossGrad(dfSampleIndexed: DataFrame): DataFrame = {
-    val bcW0 = dfSampleIndexed.sqlContext.sparkContext.broadcast(globalBias)
+  def calcLossGrad(dfSampleIndexed: DataFrame, initialSd: Double): DataFrame = {
+    require(initialSd > 0.0, "initSd (initial Standard Deviation) must be > 0.0")
 
-    val udfZeroVector = udf { () => Vectors.zeros(dimFactorization) }
+    val spark = dfSampleIndexed.sparkSession
+
+    import spark.implicits._
+
+    val bcW0 = spark.sparkContext.broadcast(globalBias)
+
+    val udfInitVec = udf {
+      () => Vectors.dense((0 until dimFactorization).map { _ => Random.nextGaussian() * initialSd } .toArray)
+    }
 
     dfSampleIndexed
       .select(
@@ -122,15 +151,24 @@ class FactorizationMachinesModel(override val uid: String,
         col("sampleId"),
         explode(FactorizationMachinesModel.udfVecToMap(col($(featuresCol)))) as Seq("featureId", "featureValue")
       )
-      .join(dimensionStrength, col("featureId") === dimensionStrength("id"), "left_outer")
-      .join(factorizedInteraction, col("featureId") === factorizedInteraction("id"), "left_outer")
+      .as("exploded")
+      .join(
+        dimensionStrength as "ds",
+        $"exploded.featureId" === $"ds.id",
+        "left_outer"
+      )
+      .join(
+        factorizedInteraction as "fi",
+        $"exploded.featureId" === $"fi.id",
+        "left_outer"
+      )
       .select(
         col($(labelCol)),
         col("sampleId"),
         col("featureId"),
         col("featureValue"),
-        coalesce(col("strength"), lit(0.0)) as "strength",
-        coalesce(col("vec"), udfZeroVector()) as "factorizedInteraction"
+        coalesce(col("strength"), randn() * initialSd) as "strength",
+        coalesce(col("vec"), udfInitVec()) as "factorizedInteraction"
       )
       .select(
         col($(labelCol)),
@@ -181,14 +219,6 @@ class FactorizationMachinesModel(override val uid: String,
         col("sampleId"),
         col("featureId"),
         (FactorizationMachinesModel.sumVx(col("vfxiSum"), col("vi2xi2Sum")) + col("wixiSum") + bcW0.value) as $(predictionCol),
-        col("deltaWi"),
-        col("deltaVi")
-      )
-      .select(
-        col($(labelCol)),
-        col("sampleId"),
-        col("featureId"),
-        least(greatest(col($(predictionCol)), lit(getMinLabel)), lit(getMaxLabel)) as $(predictionCol),
         col("deltaWi"),
         col("deltaVi")
       )

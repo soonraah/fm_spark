@@ -9,6 +9,8 @@ import org.apache.spark.sql.{DataFrame, Dataset}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.StructType
 
+import scala.util.Random
+
 private[fm] trait FactorizationMachinesSGDParams
   extends FactorizationMachinesParams
   with HasStepSize
@@ -16,6 +18,10 @@ private[fm] trait FactorizationMachinesSGDParams
   val miniBatchFraction = new Param[Double](this, "miniBatchFraction", "Minibatch flaction [0, 1] for each iterations")
 
   def getMiniBatchFraction: Double = $(miniBatchFraction)
+
+  val initialSd = new Param[Double](this, "initialSd", "Standard deviation to initialize weights")
+
+  def getInitialSd: Double = $(initialSd)
 }
 
 
@@ -50,6 +56,8 @@ class FactorizationMachinesSGD(override val uid: String)
 
   def setMaxLabel(value: Double): this.type = set(maxLabel, value)
 
+  def setInitialSd(value: Double): this.type = set(initialSd, value)
+
   setDefault(
     dimFactorization -> 10,
     featuresCol -> "features",
@@ -61,25 +69,15 @@ class FactorizationMachinesSGD(override val uid: String)
     regParam -> 0.1,
     stepSize -> 1.0,
     minLabel -> 0.0,
-    maxLabel -> 1.0
+    maxLabel -> 1.0,
+    initialSd -> 0.01
   )
 
   override def fit(dataset: Dataset[_]): FactorizationMachinesModel = {
     transformSchema(dataset.schema)
 
-    val sparkSession = dataset.sparkSession
-    import sparkSession.implicits._
-
     // create empty model
-    val initialModel = new FactorizationMachinesModel(
-      uid,
-      getDimFactorization,
-      0.0,
-      sparkSession.createDataset(Seq[Strength]()),
-      sparkSession.createDataset(Seq[FactorizedInteraction]())
-    )
-      .setMinLabel(getMinLabel)
-      .setMaxLabel(getMaxLabel)
+    val initialModel = createInitialModel(dataset)
 
     val dsSampleIndexed = FactorizationMachinesModel
       .addSampleId(dataset, $(sampleIdCol))
@@ -130,7 +128,7 @@ class FactorizationMachinesSGD(override val uid: String)
           model
         } else {
           // label, sampleId, featureId, prediction, loss, deltaWi, deltaVi
-          val dfLossGrad = model.calcLossGrad(dfMiniBatch).cache()
+          val dfLossGrad = model.calcLossGrad(dfMiniBatch, getInitialSd).cache()
 
           // Calculate loss
           val lossSum = dfLossGrad
@@ -138,10 +136,10 @@ class FactorizationMachinesSGD(override val uid: String)
             .agg(first(col("loss")) as "loss")
             .map(_.getAs[Double]("loss"))
             .reduce(_ + _)
-          log.info(s"Loss of Iteration $iter: $lossSum")
+          log.info(s"Loss of Iteration ($iter/$getMaxIter): $lossSum")
 
           // Update weights
-          val dfUpdated = dfLossGrad
+          val dfJoined = dfLossGrad
             .select(
               col("featureId"),
               (col("deltaWi") * col($(predictionCol)) - col($(labelCol))) as "deltaWi",
@@ -155,14 +153,25 @@ class FactorizationMachinesSGD(override val uid: String)
                 lit(currentStepSize / miniBatchSize)
               ) as "deltaViSum"
             )
-            .join(model.dimensionStrength, col("featureId") === model.dimensionStrength("id"), "outer")
-            .join(model.factorizedInteraction, col("featureId") === model.factorizedInteraction("id"), "outer")
+            .as("grad")
+            .join(
+              model.dimensionStrength as "ds",
+              $"grad.featureId" === $"ds.id",
+              "outer"
+            )
+            .join(
+              model.factorizedInteraction as "fi",
+              coalesce($"grad.featureId", $"ds.id") === $"fi.id",    // fi が持つ featureId は必ず ds も持つはず
+              "outer"
+            )
+
+          val dfUpdated = dfJoined
             .select(
-              col("featureId"),
-              (coalesce(col("strength"), lit(0.0)) - coalesce(col("deltaWiSum"), lit(0.0))) as "strength",
+              coalesce($"grad.featureId", $"ds.id", $"fi.id") as "featureId",
+              (coalesce($"ds.strength", lit(0.0)) - coalesce($"grad.deltaWiSum", lit(0.0))) as "strength",
               FactorizationMachinesModel.udfVecMinusVec(
-                coalesce(col("vec"), udfZeroVector()),
-                coalesce(col("deltaViSum"), udfZeroVector())
+                coalesce($"fi.vec", udfZeroVector()),
+                coalesce($"grad.deltaViSum", udfZeroVector())
               ) as "factorizedInteraction"
             )
             .select(    // L1 regularization
@@ -188,6 +197,8 @@ class FactorizationMachinesSGD(override val uid: String)
               }
               .cache()
           )
+            .setMinLabel(getMinLabel)
+            .setMaxLabel(getMaxLabel)
 
           // clean
           dfLossGrad.unpersist()
@@ -202,6 +213,42 @@ class FactorizationMachinesSGD(override val uid: String)
 
     dfData.unpersist()
     trainedModel
+  }
+
+  private def createInitialModel(dataset: Dataset[_]): FactorizationMachinesModel = {
+    val initialSd = getInitialSd
+    val dimFactorization = getDimFactorization
+
+    import dataset.sparkSession.implicits._
+
+    val dsFeatures = dataset
+      .select(
+        explode(FactorizationMachinesModel.udfVecToMap(col($(featuresCol)))) as Seq("featureId", "featureValue")
+      )
+      .select(
+        col("featureId")
+      )
+      .distinct()
+      .map { row => row.getAs[Int](0) }
+
+    val dsStrength = dsFeatures
+      .map(Strength(_, Random.nextGaussian() * initialSd))
+
+    val dsInteraction = dsFeatures
+      .map(FactorizedInteraction(
+        _,
+        Vectors.dense((0 until dimFactorization).map { _ => Random.nextGaussian() * initialSd } .toArray).toDense
+      ))
+
+    new FactorizationMachinesModel(
+      uid,
+      dimFactorization,
+      0.0,
+      dsStrength,
+      dsInteraction
+    )
+      .setMinLabel(getMinLabel)
+      .setMaxLabel(getMaxLabel)
   }
 
   override def copy(extra: ParamMap): Estimator[FactorizationMachinesModel] = defaultCopy(extra)

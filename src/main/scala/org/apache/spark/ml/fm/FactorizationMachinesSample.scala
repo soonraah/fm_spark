@@ -1,5 +1,6 @@
 package org.apache.spark.ml.fm
 
+import org.apache.log4j.{Level, Logger}
 import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.ml.linalg.Vectors
 import org.apache.spark.ml.tuning.{CrossValidator, ParamGridBuilder}
@@ -13,6 +14,11 @@ object FactorizationMachinesSample {
   val MaxMovieId: Int = 164979
 
   def main(args: Array[String]): Unit = {
+    // logger setting
+    Logger.getLogger("org").setLevel(Level.OFF)
+    Logger.getLogger("akka").setLevel(Level.OFF)
+    Logger.getLogger("org.apache.spark.ml.fm").setLevel(Level.INFO)
+
     // Create SparkSession
     val spark = SparkSession
       .builder()
@@ -25,6 +31,7 @@ object FactorizationMachinesSample {
 
     // Create DataFrames
     val dfFeature = createRatingDataFrame(spark, ratingsFile)
+
     val dfs = dfFeature.randomSplit(Array(0.9, 0.1))
     val dfTraining = dfs(0)     // for cross validation
     val dfEvaluation = dfs(1)   // for test
@@ -33,41 +40,61 @@ object FactorizationMachinesSample {
 
     // Run cross validation
     val fm = new FactorizationMachinesSGD()
+      .setMaxIter(5)
+      .setMiniBatchFraction(0.2)
+      .setMinLabel(minLabel)
+      .setMaxLabel(maxLabel)
+      .setInitialSd(0.01)
+      .setStepSize(1.0)
+
     val paramMap = new ParamGridBuilder()
-      .addGrid(fm.regParam, Array(0.1, 0.01))
-      .addGrid(fm.maxIter, Array(5))
-      .addGrid(fm.minLabel, Array(1.0))
-      .addGrid(fm.maxLabel, Array(5.0))
+      .addGrid(fm.regParam, Array(1.0e-6, 0.0))
       .build()
+
+    val evaluator = new RegressionEvaluator().setMetricName("mae")
 
     val cvModel = new CrossValidator()
       .setEstimator(fm)
       .setEstimatorParamMaps(paramMap)
-      .setEvaluator(new RegressionEvaluator())
+      .setEvaluator(evaluator)
       .setNumFolds(2)
       .fit(dfTraining)
 
+    cvModel.avgMetrics.zipWithIndex.foreach { t => println(s"Cross validation MAE ${t._2}: ${t._1}")}
+
     // Test
-    cvModel.transform(dfEvaluation).show(100)
+    val dfPredicted = cvModel.transform(dfEvaluation).cache()
+    dfPredicted.show(100)
+
+    val mae = evaluator.evaluate(dfPredicted)
+    println(s"Test MAE: $mae")
+
+    spark.stop()
   }
 
   private def createRatingDataFrame(spark: SparkSession, ratingFile: String): DataFrame = {
-    // userId,movieId,rating,timestamp
     val udfCrateFeatureVec = udf {
       (userId: Int, movieRatings: Seq[_], currentMovie: Int) => {
-        val featureMap = movieRatings
-          .map { s =>
-            val items = s.toString.split(":")
-            (items(0).toInt, items(1).toDouble)   // other movies rated
-          }
-          .filter(_._1 != currentMovie)
-          .map { t => (t._1 + MaxUserId + MaxMovieId, t._2)}
-          .toMap + (userId -> 1.0) + (MaxUserId + currentMovie -> 1.0)
+        val ratingMap = if (movieRatings.size < 2) {
+          Map[Int, Double]()
+        } else {
+          val ratingWeight = 1.0 / (movieRatings.size - 1.0)
+          movieRatings
+            .map { s =>
+              val items = s.toString.split(":")
+              items(0).toInt    // other movies rated
+            }
+            .filter(_ != currentMovie)
+            .map { movieId => (MaxUserId + MaxMovieId + movieId, ratingWeight) }
+            .toMap
+        }
+        val featureMap = ratingMap + (userId -> 1.0, MaxUserId + currentMovie -> 1.0)
 
         Vectors.sparse(MaxUserId + MaxMovieId + MaxMovieId, featureMap.toSeq)
       }
     }
 
+    // userId,movieId,rating,timestamp
     val dfRating = spark
       .read
       .option("header", value = true)
@@ -81,7 +108,7 @@ object FactorizationMachinesSample {
       )
       .groupBy(col("userId"))
       .agg(
-        collect_list(col("movieRating")) as "movieRatings"
+        collect_set(col("movieRating")) as "movieRatings"
       )
       .select(
         col("userId"),
