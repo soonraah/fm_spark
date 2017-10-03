@@ -9,4 +9,4 @@ FactorizationMachines by Apache Spark
 - Support APIs of `apache.spark.ml`
     - be able to run cross validation
 - `DataFrame` based implementation
-- Now only support optimization by mini-batch SGD
+- Support only optimization by mini-batch SGD now
